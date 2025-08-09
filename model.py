@@ -7,13 +7,13 @@ import numpy as np
 from co_attention import Co_attention_block
 class CLIP4Meme(nn.Module):
     """
-    Model refactored to align with the paper's QI and QC branches,
-    while maintaining a two-stage training structure.
+    Model with a STABLE architecture for Stage 1 (QI) training.
     """
     def __init__(self,
                  pretrained_clip_name: str = "ViT-B/32",
                  bert_model_name: str = 'bert-base-chinese'):
         super(CLIP4Meme, self).__init__()
+        # 模型组件初始化 (与之前版本相同)
         self.clip, self.clip_preprocess = clip.load(pretrained_clip_name, device='cpu', jit=False)
         self.bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
         self.bert_model = BertModel.from_pretrained(bert_model_name)
@@ -25,6 +25,7 @@ class CLIP4Meme(nn.Module):
         )
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+    # 各个编码器函数 (与之前版本相同)
     def get_bert_tokenizer(self):
         return self.bert_tokenizer
 
@@ -52,24 +53,21 @@ class CLIP4Meme(nn.Module):
 
     def forward(self,
                 query_ids,
-                candidate_ids=None, # Stage 1 does not need this for computation
-                image=None,
+                candidate_ids, # Stage 1 now requires this for computation
+                image,
                 emotion_ids=None,
                 emotion_mask=None,
                 training_stage: str = 'stage1_qi'):
 
         # ====================================================================
-        # 阶段一 (Stage 1): 训练 QI (Query-Image) 相似度
+        # 阶段一 (Stage 1): 训练 QI (Query-Image) 相似度 [稳定版架构]
         # ====================================================================
         if training_stage == 'stage1_qi':
-            if image is None:
-                raise ValueError("Image tensor must be provided for QI training.")
-            
-            # 1. 提取基础特征
+            # 1. 提取所有需要的特征
             image_feat = self.encode_image(image)
             query_feat_pooled = self.encode_text_pooled(query_ids)
-            # *** 关键修改: 现在获取 Query 的 token-level 特征用于融合 ***
-            query_feat_tokens, query_mask = self.encode_text_tokens(query_ids)
+            # *** 关键修改: 现在获取 Context (candidate_ids) 的 token-level 特征用于融合 ***
+            candidate_feat_tokens, candidate_mask = self.encode_text_tokens(candidate_ids)
 
             # 2. [可选] 融合情感特征到图像特征
             if emotion_ids is not None:
@@ -79,19 +77,19 @@ class CLIP4Meme(nn.Module):
                 image_feat = image_feat + projected_emotion_feat
             
             # 3. 跨模态融合 (Cross-Modal Fusion)
-            # *** 关键修改: Co-attention 现在融合 Image 和 Query ***
+            # *** 关键修改: Co-attention 现在融合 Image 和 Context (图片描述) ***
+            # 这是更稳定、更合理的架构，避免了信息泄漏。
             image_feat_seq = F.normalize(image_feat, dim=-1).unsqueeze(1)
             image_mask_for_attention = torch.ones(image_feat_seq.size(0), 1, 1, 1).to(image.device)
             
-            fused_representation, _ = self.co_attention(
+            fused_image_feat, _ = self.co_attention(
                 image_feat_seq, image_mask_for_attention,
-                query_feat_tokens, query_mask # 使用 query 特征进行交互
+                candidate_feat_tokens, candidate_mask # 使用 context 特征进行交互
             )
             
             # 4. 计算相似度
-            # 论文描述: "...计算主题文本特征 e_q 与跨模态融合特征 cross(...) 之间的QI 相似度。"
-            # 这意味着我们将原始的 query 特征与融合后的表示进行比较。
-            final_fused_feat = fused_representation.squeeze(1)
+            # 现在，我们用独立的 Query 特征去匹配融合后的“图像+上下文”特征。
+            final_fused_feat = fused_image_feat.squeeze(1)
             
             query_feat_pooled = F.normalize(query_feat_pooled, dim=-1)
             final_fused_feat = F.normalize(final_fused_feat, dim=-1)
@@ -101,17 +99,12 @@ class CLIP4Meme(nn.Module):
             return sim_matrix
 
         # ====================================================================
-        # 阶段二 (Stage 2): 训练 QC (Query-Context) 相似度
+        # 阶段二 (Stage 2): 训练 QC (Query-Context) 相似度 [逻辑不变]
         # ====================================================================
         elif training_stage == 'stage2_qc':
-            if candidate_ids is None:
-                raise ValueError("Candidate text tensor must be provided for QC training.")
-                
-            # 1. 提取 Query 和 Context 特征
             query_feat_pooled = self.encode_text_pooled(query_ids)
             candidate_feat_pooled = self.encode_text_pooled(candidate_ids)
             
-            # 2. 计算相似度
             query_feat_pooled = F.normalize(query_feat_pooled, dim=-1)
             candidate_feat_pooled = F.normalize(candidate_feat_pooled, dim=-1)
             sim_matrix = torch.matmul(query_feat_pooled, candidate_feat_pooled.t()) * self.logit_scale.exp()
