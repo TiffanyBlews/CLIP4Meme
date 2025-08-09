@@ -41,9 +41,11 @@ def symmetric_contrastive_loss(sim_matrix):
     return loss
 
 def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samples=5):
-    """评估函数已适配新的 QI 和 QC 阶段"""
+    """
+    评估函数已更新，为阶段一（QI）实现完整、精确但较慢的评估逻辑。
+    """
     model.eval()
-    print(f"\n--- Evaluating Stage {stage} ({'QI' if stage == 1 else 'QC'}) ---")
+    print(f"\n--- Evaluating Stage {stage} ({'QI-Accurate' if stage == 1 else 'QC'}) ---")
     
     # 1. 收集元数据 (与之前相同)
     all_video_ids_meta = [item['video_id'] for item in test_dataset.data]
@@ -56,37 +58,67 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
     # 2. 缓存所有查询和目标的特征
     all_q_feats, all_target_feats = [], []
     with torch.no_grad():
-        for batch in tqdm(test_dataloader, desc=f"Caching Features (Stage {stage})"):
+        # 步骤 2.1: 高效地一次性缓存所有查询文本的特征
+        print("Caching all query features...")
+        for batch in tqdm(test_dataloader, desc="Caching Queries"):
             query_ids = batch['query_ids'].to(device)
             q_feat = model.encode_text_pooled(query_ids)
             all_q_feats.append(q_feat.cpu())
+        all_q_feats = torch.cat(all_q_feats, dim=0)
 
-            if stage == 1: # 评估 QI 分支
-                image = batch['image'].to(device)
-                emotion_ids = batch['emotion_input_ids'].to(device)
-                emotion_mask = batch['emotion_attention_mask'].to(device)
-                # 在评估时，为保持高效，我们通常不进行完整的co-attention，
-                # 而是使用其核心组件，即情感融合后的图像特征。
-                image_feat = model.encode_image(image)
-                if emotion_ids is not None:
-                    emotion_feat_bert = model.encode_emotion(emotion_ids, emotion_mask)
+        # 步骤 2.2: 根据不同阶段计算目标特征
+        print(f"Calculating all target features for Stage {stage}...")
+        if stage == 1: # 评估 QI 分支 (精确但缓慢的路径)
+            # 我们需要为每个图文对计算其完整的融合特征
+            for batch in tqdm(test_dataloader, desc="Calculating Fused QI Features"):
+                # *** 这是核心修改：我们直接调用模型 stage1_qi 的前向传播 ***
+                # *** 以获取与训练时完全一致的、经过Co-attention的特征 ***
+                sim_matrix_batch = model(
+                    query_ids=batch['query_ids'].to(device), # 传入以满足函数签名，但内部不会用于最终输出
+                    candidate_ids=batch['candidate_ids'].to(device),
+                    image=batch['image'].to(device),
+                    emotion_ids=batch['emotion_input_ids'].to(device),
+                    emotion_mask=batch['emotion_attention_mask'].to(device),
+                    training_stage='stage1_qi'
+                )
+                # 这里的 sim_matrix_batch 是 Query vs Fused(Image,Context)
+                # 为了得到独立的 Fused(Image,Context) 特征，我们需要分解它
+                # 一个简化的做法是假设logit_scale和归一化效果可以近似抵消
+                # 或者，更严谨地，我们需要修改模型返回融合后的特征
+                # 为简单起见，我们直接在评估时重新计算融合特征
+                
+                # --- 重复模型内部逻辑来获取融合特征 ---
+                image_feat = model.encode_image(batch['image'].to(device))
+                candidate_feat_tokens, candidate_mask = model.encode_text_tokens(batch['candidate_ids'].to(device))
+                if batch['emotion_input_ids'] is not None:
+                    emotion_feat_bert = model.encode_emotion(batch['emotion_input_ids'].to(device), batch['emotion_attention_mask'].to(device))
                     projected_emotion_feat = model.emotion_projection(emotion_feat_bert.type(model.emotion_projection.weight.dtype))
                     image_feat = image_feat + projected_emotion_feat
-                all_target_feats.append(image_feat.cpu())
-            
-            elif stage == 2: # 评估 QC 分支
+                image_feat_seq = F.normalize(image_feat, dim=-1).unsqueeze(1)
+                image_mask_for_attention = torch.ones(image_feat_seq.size(0), 1, 1, 1).to(device)
+                
+                fused_image_feat, _ = model.co_attention(
+                    image_feat_seq, image_mask_for_attention,
+                    candidate_feat_tokens, candidate_mask
+                )
+                final_fused_feat = fused_image_feat.squeeze(1)
+                all_target_feats.append(final_fused_feat.cpu())
+
+        elif stage == 2: # 评估 QC 分支 (逻辑不变，本身就是高效的)
+            for batch in tqdm(test_dataloader, desc="Caching QC Features"):
                 candidate_ids = batch['candidate_ids'].to(device)
                 c_feat = model.encode_text_pooled(candidate_ids)
                 all_target_feats.append(c_feat.cpu())
+        
+        all_target_feats = torch.cat(all_target_feats, dim=0)
 
-    all_q_feats = F.normalize(torch.cat(all_q_feats, dim=0), dim=-1)
-    all_target_feats = F.normalize(torch.cat(all_target_feats, dim=0), dim=-1)
-    
     # 3. 计算总相似度矩阵并评估
+    all_q_feats = F.normalize(all_q_feats, dim=-1)
+    all_target_feats = F.normalize(all_target_feats, dim=-1)
     sim_matrix = torch.matmul(all_q_feats, all_target_feats.t())
     
-    # R@k 计算和详细打印逻辑 (与之前相同)
-    # ... (此处省略与上一版完全相同的 R@k 计算和打印代码) ...
+    # 4. R@k 计算和详细打印逻辑 (与之前相同)
+    # ... (省略与上一版完全相同的 R@k 计算和打印代码) ...
     print("\n--- Computing R@k & Detailed Predictions ---")
     num_queries = sim_matrix.shape[0]
     recalls = {}
@@ -110,7 +142,7 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
     print("\n--- Final Evaluation Results ---")
     for k, v in recalls.items(): print(f"  {k}: {v:.2f}%")
     return recalls
-
+    
 def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
