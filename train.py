@@ -30,7 +30,7 @@ CONFIG = {
     "pretrained_clip_name": "ViT-B/32", "use_emotion_fusion": True, "seed": 42,
 
     "save_dir": "./checkpoints_imgflip",
-    "stage1_checkpoint_path": "./checkpoints_imgflip/stage1_qi_best.pth"
+    "checkpoint_path": "./checkpoints_imgflip/stage2_qc_best.pth"
 }
 
 def symmetric_contrastive_loss(sim_matrix):
@@ -38,13 +38,9 @@ def symmetric_contrastive_loss(sim_matrix):
     loss = (F.cross_entropy(sim_matrix, labels) + F.cross_entropy(sim_matrix.t(), labels)) / 2
     return loss
 
-def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samples=5):
-    """
-    评估函数已更新，为阶段一（QI）实现完整、精确但高效的评估逻辑。
-    现在使用模型的return_features功能，避免了重复计算融合特征。
-    """
+def eval_epoch(model, test_dataset, test_dataloader, device, branch, print_n_samples=5):
     model.eval()
-    print(f"\n--- Evaluating Stage {stage} ({'QI-Accurate' if stage == 1 else 'QC'}) ---")
+    print(f"\n--- Evaluating {branch} branch ---")
     
     # 1. 收集元数据
     all_video_ids_meta = [item['video_id'] for item in test_dataset.data]
@@ -65,9 +61,9 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
             all_q_feats.append(q_feat.cpu())
         all_q_feats = torch.cat(all_q_feats, dim=0)
 
-        # 步骤 2.2: 根据不同阶段计算目标特征
-        print(f"Calculating all target features for Stage {stage}...")
-        if stage == 1: # 评估 QI 分支 (使用return_features避免重复计算)
+        # 步骤 2.2: 根据不同分支计算目标特征
+        print(f"Calculating all target features for {branch} branch...")
+        if branch == 'QI': # 评估 QI 分支 (使用return_features避免重复计算)
             # 使用模型的return_features功能，避免重复计算
             for batch in tqdm(test_dataloader, desc="Calculating Fused QI Features"):
                 query_feat, fused_feat = model(
@@ -76,13 +72,13 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
                     image=batch['image'].to(device),
                     emotion_ids=batch['emotion_input_ids'].to(device),
                     emotion_mask=batch['emotion_attention_mask'].to(device),
-                    training_stage='stage1_qi',
+                    branch='qi',
                     return_features=True
                 )
                 # 直接使用模型返回的融合特征，无需重复计算
                 all_target_feats.append(fused_feat.cpu())
 
-        elif stage == 2: # 评估 QC 分支 (使用return_features保持一致性)
+        elif branch == 'QC': # 评估 QC 分支 (使用return_features保持一致性)
             for batch in tqdm(test_dataloader, desc="Caching QC Features"):
                 query_feat, candidate_feat = model(
                     query_ids=batch['query_ids'].to(device),
@@ -90,7 +86,7 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
                     image=batch['image'].to(device),  # QC不需要图片，但为了保持接口一致
                     emotion_ids=batch['emotion_input_ids'].to(device),
                     emotion_mask=batch['emotion_attention_mask'].to(device),
-                    training_stage='stage2_qc',
+                    branch='qc',
                     return_features=True
                 )
                 # 直接使用模型返回的特征，保持与QI分支的一致性
@@ -103,7 +99,7 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
     all_target_feats = F.normalize(all_target_feats, dim=-1)
     sim_matrix = torch.matmul(all_q_feats, all_target_feats.t())
     
-    # 4. R@k 计算和详细打印逻辑 (与之前相同)
+    # 4. R@k 计算和详细打印逻辑
     print("\n--- Computing R@k & Detailed Predictions ---")
     num_queries = sim_matrix.shape[0]
     recalls = {}
@@ -135,8 +131,8 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.save_dir, exist_ok=True)
     
-    stage_name = 'QI' if args.stage == 1 else 'QC'
-    print(f"--- Starting Training for Stage {args.stage}: {stage_name} ---")
+    branch_name = args.train.upper()
+    print(f"--- Starting Training for {branch_name} branch ---")
 
     # 1. 初始化模型和数据
     model = CLIP4Meme(pretrained_clip_name=args.pretrained_clip_name)
@@ -150,7 +146,7 @@ def main(args):
         bert_tokenizer=model.get_bert_tokenizer(),
         clip_preprocess=model.clip_preprocess,
         is_train=True,
-        load_image=(args.stage == 1) # 阶段一加载图片，阶段二不加载
+        load_image=(args.train.lower() == 'qi') # QI分支加载图片，QC分支不加载
     )
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     
@@ -162,7 +158,7 @@ def main(args):
         bert_tokenizer=model.get_bert_tokenizer(),
         clip_preprocess=model.clip_preprocess,
         is_train=False,
-        load_image=True # 评估时总是加载图片，以备阶段一评估
+        load_image=True # 评估时总是加载图片，以备QI分支评估
     )
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
@@ -171,38 +167,38 @@ def main(args):
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr * args.coef_lr},
         {'params': [p for n, p in model.clip.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': args.lr * args.coef_lr},
-        {'params': [p for n, p in model.bert_model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': 0 if args.stage == 2 else args.lr * args.coef_lr},
-        {'params': [p for n, p in model.bert_model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': 0 if args.stage == 2 else args.lr * args.coef_lr},
+        {'params': [p for n, p in model.bert_model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': 0 if args.train.lower() == 'qc' else args.lr * args.coef_lr},
+        {'params': [p for n, p in model.bert_model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': 0 if args.train.lower() == 'qc' else args.lr * args.coef_lr},
         {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr},
         {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': args.lr}
     ]
     optimizer = optim.AdamW(optimizer_grouped_parameters, lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
-    # 3. 加载阶段一模型 (仅在阶段二)
-    if args.stage == 2:
-        if not os.path.exists(args.stage1_checkpoint_path):
-            raise FileNotFoundError(f"Stage 2 requires Stage 1 checkpoint: {args.stage1_checkpoint_path}")
-        print(f"--- Loading Stage 1 (QI) checkpoint for Stage 2 (QC) training ---")
-        checkpoint = torch.load(args.stage1_checkpoint_path, map_location=device)
+    # 3. 加载检查点 (QI和QC分支共享相同的检查点)
+    if os.path.exists(args.checkpoint_path):
+        print(f"--- Loading checkpoint for {branch_name} branch training ---")
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        print("--- No checkpoint found, starting from scratch ---")
 
     # 4. 训练循环
     best_r1 = 0.0
     for epoch in range(args.epochs):
         model.train()
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs} [{stage_name}]")
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs} [{branch_name}]")
         for batch in pbar:
             optimizer.zero_grad()
             
-            # *** 修改点: 调用模型时传入正确的参数和 stage name ***
+            # 调用模型时传入正确的分支名称
             sim_matrix = model(
                 query_ids=batch['query_ids'].to(device),
                 candidate_ids=batch['candidate_ids'].to(device),
                 image=batch['image'].to(device),
                 emotion_ids=batch['emotion_input_ids'].to(device),
                 emotion_mask=batch['emotion_attention_mask'].to(device),
-                training_stage=f'stage{args.stage}_{stage_name.lower()}'
+                branch=branch_name.lower()
             )
             
             loss = symmetric_contrastive_loss(sim_matrix)
@@ -214,17 +210,24 @@ def main(args):
         scheduler.step()
         
         # 评估和保存
-        eval_results = eval_epoch(model, test_dataset, test_dataloader, device, args.stage)
+        eval_results = eval_epoch(model, test_dataset, test_dataloader, device, branch_name)
         if eval_results.get('R@1', 0) > best_r1:
             best_r1 = eval_results.get('R@1', 0)
-            # *** 修改点: 更新保存路径 ***
-            save_path = os.path.join(args.save_dir, f'stage{args.stage}_{stage_name.lower()}_best.pth')
+            
+            # 构建新的检查点文件名：原文件名 + 当前分支名
+            base_name = os.path.splitext(os.path.basename(args.checkpoint_path))[0]
+            if base_name == "checkpoint":  # 如果是默认名称，直接使用分支名
+                new_checkpoint_name = f"{branch_name.lower()}.pth"
+            else:  # 否则在原文件名后添加当前分支名
+                new_checkpoint_name = f"{base_name}_{branch_name.lower()}.pth"
+            
+            save_path = os.path.join(args.save_dir, new_checkpoint_name)
             print(f"*** New best R@1: {best_r1:.2f}%. Saving model to {save_path} ***")
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict()}, save_path)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train Meme-Retrieval model based on paper's QI/QC branches.")
-    parser.add_argument('--stage', type=int, required=True, choices=[1, 2], help="1 for QI-branch, 2 for QC-branch.")
+    parser = argparse.ArgumentParser(description="Train Meme-Retrieval model based on QI/QC branches.")
+    parser.add_argument('--train', type=str, required=True, choices=['qi', 'qc'], help="Train QI or QC branch")
     for key, value in CONFIG.items():
         parser.add_argument(f'--{key}', type=type(value) if value is not None else str, default=value)
     parsed_args = parser.parse_args()

@@ -55,21 +55,21 @@ class CLIP4Meme(nn.Module):
 
     def forward(self,
                 query_ids,
-                candidate_ids, # Stage 1 now requires this for computation
+                candidate_ids,
                 image,
                 emotion_ids=None,
                 emotion_mask=None,
-                training_stage: str = 'stage1_qi',
+                branch: str = 'qi',
                 return_features: bool = False):
 
         # ====================================================================
-        # 阶段一 (Stage 1): 训练 QI (Query-Image) 相似度 [稳定版架构]
+        # QI分支: 训练 Query-Image 相似度
         # ====================================================================
-        if training_stage == 'stage1_qi':
+        if branch == 'qi':
             # 1. 提取所有需要的特征
             image_feat = self.encode_image(image)
             query_feat_pooled = self.encode_text_pooled(query_ids)
-            # *** 关键修改: 现在获取 Context (candidate_ids) 的 token-level 特征用于融合 ***
+            # 获取 Context (candidate_ids) 的 token-level 特征用于融合
             candidate_feat_tokens, candidate_mask = self.encode_text_tokens(candidate_ids)
 
             # 2. [可选] 融合情感特征到图像特征
@@ -80,8 +80,7 @@ class CLIP4Meme(nn.Module):
                 image_feat = image_feat + projected_emotion_feat
             
             # 3. 跨模态融合 (Cross-Modal Fusion)
-            # *** 关键修改: Co-attention 现在融合 Image 和 Context (图片描述) ***
-            # 这是更稳定、更合理的架构，避免了信息泄漏。
+            # Co-attention 融合 Image 和 Context (图片描述)
             image_feat_seq = F.normalize(image_feat, dim=-1).unsqueeze(1)
             image_mask_for_attention = torch.ones(image_feat_seq.size(0), 1, 1, 1).to(image.device)
             
@@ -91,7 +90,7 @@ class CLIP4Meme(nn.Module):
             )
             
             # 4. 计算相似度
-            # 现在，我们用独立的 Query 特征去匹配融合后的“图像+上下文”特征。
+            # 用独立的 Query 特征去匹配融合后的"图像+上下文"特征
             final_fused_feat = fused_image_feat.squeeze(1)
             
             query_feat_pooled = F.normalize(query_feat_pooled, dim=-1)
@@ -106,9 +105,9 @@ class CLIP4Meme(nn.Module):
             return sim_matrix
 
         # ====================================================================
-        # 阶段二 (Stage 2): 训练 QC (Query-Context) 相似度 [逻辑不变]
+        # QC分支: 训练 Query-Context 相似度
         # ====================================================================
-        elif training_stage == 'stage2_qc':
+        elif branch == 'qc':
             query_feat_pooled = self.encode_text_pooled(query_ids)
             candidate_feat_pooled = self.encode_text_pooled(candidate_ids)
             
@@ -124,7 +123,7 @@ class CLIP4Meme(nn.Module):
             return sim_matrix
         
         else:
-            raise ValueError(f"Unknown training_stage: {training_stage}")
+            raise ValueError(f"Unknown branch: {branch}")
 
     def inference_fusion(self, 
                         query_ids, 
@@ -132,7 +131,7 @@ class CLIP4Meme(nn.Module):
                         image, 
                         emotion_ids=None, 
                         emotion_mask=None,
-                        alpha: float = 0.6,
+                        alpha: float = 0.5,
                         temperature: float = 0.07):
         """
         推理时的融合方法：同时利用QI和QC分支，加权得到最终结果
@@ -149,7 +148,7 @@ class CLIP4Meme(nn.Module):
                 image=image,
                 emotion_ids=emotion_ids,
                 emotion_mask=emotion_mask,
-                training_stage='stage1_qi'
+                branch='qi'
             )
             
             # 2. 计算QC分支的相似度
@@ -159,7 +158,7 @@ class CLIP4Meme(nn.Module):
                 image=image,  # QC不需要图片，但为了保持接口一致
                 emotion_ids=emotion_ids,
                 emotion_mask=emotion_mask,
-                training_stage='stage2_qc'
+                branch='qc'
             )
             
             # 3. 加权融合

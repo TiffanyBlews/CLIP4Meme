@@ -43,7 +43,7 @@ def evaluate_fusion(model, test_dataset, test_dataloader, device,
                 image=batch['image'].to(device),
                 emotion_ids=batch['emotion_input_ids'].to(device),
                 emotion_mask=batch['emotion_attention_mask'].to(device),
-                training_stage='stage1_qi',
+                branch='qi',
                 return_features=True
             )
             
@@ -54,7 +54,7 @@ def evaluate_fusion(model, test_dataset, test_dataloader, device,
                 image=batch['image'].to(device),
                 emotion_ids=batch['emotion_input_ids'].to(device),
                 emotion_mask=batch['emotion_attention_mask'].to(device),
-                training_stage='stage2_qc',
+                branch='qc',
                 return_features=True
             )
             
@@ -168,7 +168,7 @@ def compare_branches(model, test_dataset, test_dataloader, device, alpha=0.6):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate fusion method for QI+QC branches")
-    parser.add_argument('--checkpoint', type=str, default="checkpoints_imgflip/stage2_qc_best.pth",
+    parser.add_argument('--checkpoint', type=str, default="checkpoints_imgflip/stage2_qc_best_qi.pth",
                        help="Path to model checkpoint")
     parser.add_argument('--data_path', type=str, default="/root/zt/imgflip_results/msrvtt",
                        help="Path to data directory")

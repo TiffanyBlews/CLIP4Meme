@@ -1,8 +1,8 @@
-# CLIP4Meme: 基于CLIP的多模态Meme检索系统
+# CLIP4Meme: 基于CLIP的Meme图片推荐系统
 
 ## 项目简介
 
-CLIP4Meme是一个基于CLIP（Contrastive Language-Image Pre-training）的多模态Meme检索系统，采用两阶段训练策略（QI + QC）来提升检索性能。该系统能够理解图像、文本和情感信息，实现高质量的Meme内容检索。
+CLIP4Meme是一个基于CLIP（Contrastive Language-Image Pre-training）的多模态Meme图片检索推荐系统，采用两分支训练策略（QI + QC）来提升检索性能。该系统能够理解图像、文本和情感信息，实现高质量的Meme内容检索。
 
 ## 核心特性
 
