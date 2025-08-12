@@ -1,3 +1,5 @@
+# model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,7 +59,8 @@ class CLIP4Meme(nn.Module):
                 image,
                 emotion_ids=None,
                 emotion_mask=None,
-                training_stage: str = 'stage1_qi'):
+                training_stage: str = 'stage1_qi',
+                return_features: bool = False):
 
         # ====================================================================
         # 阶段一 (Stage 1): 训练 QI (Query-Image) 相似度 [稳定版架构]
@@ -94,6 +97,10 @@ class CLIP4Meme(nn.Module):
             query_feat_pooled = F.normalize(query_feat_pooled, dim=-1)
             final_fused_feat = F.normalize(final_fused_feat, dim=-1)
             
+            # 如果只需要特征，直接返回
+            if return_features:
+                return query_feat_pooled, final_fused_feat
+            
             sim_matrix = torch.matmul(query_feat_pooled, final_fused_feat.t()) * self.logit_scale.exp()
             
             return sim_matrix
@@ -107,9 +114,57 @@ class CLIP4Meme(nn.Module):
             
             query_feat_pooled = F.normalize(query_feat_pooled, dim=-1)
             candidate_feat_pooled = F.normalize(candidate_feat_pooled, dim=-1)
+            
+            # 如果只需要特征，直接返回
+            if return_features:
+                return query_feat_pooled, candidate_feat_pooled
+                
             sim_matrix = torch.matmul(query_feat_pooled, candidate_feat_pooled.t()) * self.logit_scale.exp()
 
             return sim_matrix
         
         else:
             raise ValueError(f"Unknown training_stage: {training_stage}")
+
+    def inference_fusion(self, 
+                        query_ids, 
+                        candidate_ids, 
+                        image, 
+                        emotion_ids=None, 
+                        emotion_mask=None,
+                        alpha: float = 0.6,
+                        temperature: float = 0.07):
+        """
+        推理时的融合方法：同时利用QI和QC分支，加权得到最终结果
+        
+        Args:
+            alpha: QI分支的权重，QC分支权重为(1-alpha) (默认0.6)
+            temperature: 温度参数，控制相似度分布的尖锐程度
+        """
+        with torch.no_grad():
+            # 1. 计算QI分支的相似度
+            qi_sim = self.forward(
+                query_ids=query_ids,
+                candidate_ids=candidate_ids,
+                image=image,
+                emotion_ids=emotion_ids,
+                emotion_mask=emotion_mask,
+                training_stage='stage1_qi'
+            )
+            
+            # 2. 计算QC分支的相似度
+            qc_sim = self.forward(
+                query_ids=query_ids,
+                candidate_ids=candidate_ids,
+                image=image,  # QC不需要图片，但为了保持接口一致
+                emotion_ids=emotion_ids,
+                emotion_mask=emotion_mask,
+                training_stage='stage2_qc'
+            )
+            
+            # 3. 加权融合
+            # 注意：这里使用logits进行加权，然后重新应用temperature
+            # Final = α × QI + (1-α) × QC
+            fused_sim = (alpha * qi_sim + (1 - alpha) * qc_sim) / temperature
+            
+            return fused_sim, qi_sim, qc_sim

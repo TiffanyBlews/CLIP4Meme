@@ -88,7 +88,7 @@ class MSRVTT_Dataset(Dataset):
         # --- 按需处理图片 ---
         image_tensor = torch.zeros(1) # 返回一个哑元 (dummy tensor)
         if self.load_image:
-            image_path = os.path.join(self.features_path, f"{video_id}.jpg")
+            image_path = os.path.join(self.features_path, video_id if '.' in video_id else f"{video_id}.jpg")
             if not os.path.exists(image_path):
                 # 如果找不到，可以返回一个零张量并打印警告，而不是中断程序
                 print(f"Warning: Image not found at {image_path}. Returning a zero tensor.")

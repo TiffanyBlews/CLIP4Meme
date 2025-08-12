@@ -1,4 +1,4 @@
-# model_efb_v2.py
+# co_attention.py
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ import math
 
 # ====================================================================================
 #  从 clip4clip 移植过来的 Co-attention 模块及其依赖项
-#  我们在这里复用这些成熟的模块来实现 图像-上下文 交互
+#  source: https://github.com/ArrowLuo/CLIP4Clip/tree/master/modules
 # ====================================================================================
 
 class BertBiAttention(nn.Module):

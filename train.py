@@ -15,24 +15,22 @@ from collections import defaultdict
 from model import CLIP4Meme
 from dataset import MSRVTT_Dataset
 
-# 配置信息保持不变
 CONFIG = {
-    "data_path": "/root/zt/data_topics/input_file",
-    "image_path": "/root/zt/data_topics/image",
-    "train_csv": "train_video_id_9k.csv",
-    "train_json": "train_9k.json",
+    "data_path": "/root/zt/imgflip_results/msrvtt",
+    "image_path": "/root/zt/imgflip_results/images",
+    "train_csv": "train_ids.csv",
+    "train_json": "train_data.json",
     "train_emotion_json": "train_emotion.json",
-    "test_json": "test_4k.json",
+    "test_json": "test_data.json",
     "test_emotion_json": "test_emotion.json",
     
-    "batch_size": 64, "epochs": 20, "lr": 1e-4, "coef_lr": 1e-3,
+    "batch_size": 64, "epochs": 20, "lr": 5e-4, "coef_lr": 1e-3,
     "weight_decay": 0.01, "min_lr": 0,
     
     "pretrained_clip_name": "ViT-B/32", "use_emotion_fusion": True, "seed": 42,
 
-    "save_dir": "./checkpoints_final",
-    # *** 修改点: 更新了阶段一 checkpoint 的默认路径 ***
-    "stage1_checkpoint_path": "./checkpoints_final/stage1_qi_best.pth"
+    "save_dir": "./checkpoints_imgflip",
+    "stage1_checkpoint_path": "./checkpoints_imgflip/stage1_qi_best.pth"
 }
 
 def symmetric_contrastive_loss(sim_matrix):
@@ -42,12 +40,13 @@ def symmetric_contrastive_loss(sim_matrix):
 
 def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samples=5):
     """
-    评估函数已更新，为阶段一（QI）实现完整、精确但较慢的评估逻辑。
+    评估函数已更新，为阶段一（QI）实现完整、精确但高效的评估逻辑。
+    现在使用模型的return_features功能，避免了重复计算融合特征。
     """
     model.eval()
     print(f"\n--- Evaluating Stage {stage} ({'QI-Accurate' if stage == 1 else 'QC'}) ---")
     
-    # 1. 收集元数据 (与之前相同)
+    # 1. 收集元数据
     all_video_ids_meta = [item['video_id'] for item in test_dataset.data]
     all_captions_meta = [item['query'] for item in test_dataset.data]
     all_titles_meta = [item['candidate_texts'][0] if item['candidate_texts'] else "" for item in test_dataset.data]
@@ -68,47 +67,34 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
 
         # 步骤 2.2: 根据不同阶段计算目标特征
         print(f"Calculating all target features for Stage {stage}...")
-        if stage == 1: # 评估 QI 分支 (精确但缓慢的路径)
-            # 我们需要为每个图文对计算其完整的融合特征
+        if stage == 1: # 评估 QI 分支 (使用return_features避免重复计算)
+            # 使用模型的return_features功能，避免重复计算
             for batch in tqdm(test_dataloader, desc="Calculating Fused QI Features"):
-                # *** 这是核心修改：我们直接调用模型 stage1_qi 的前向传播 ***
-                # *** 以获取与训练时完全一致的、经过Co-attention的特征 ***
-                sim_matrix_batch = model(
-                    query_ids=batch['query_ids'].to(device), # 传入以满足函数签名，但内部不会用于最终输出
+                query_feat, fused_feat = model(
+                    query_ids=batch['query_ids'].to(device),
                     candidate_ids=batch['candidate_ids'].to(device),
                     image=batch['image'].to(device),
                     emotion_ids=batch['emotion_input_ids'].to(device),
                     emotion_mask=batch['emotion_attention_mask'].to(device),
-                    training_stage='stage1_qi'
+                    training_stage='stage1_qi',
+                    return_features=True
                 )
-                # 这里的 sim_matrix_batch 是 Query vs Fused(Image,Context)
-                # 为了得到独立的 Fused(Image,Context) 特征，我们需要分解它
-                # 一个简化的做法是假设logit_scale和归一化效果可以近似抵消
-                # 或者，更严谨地，我们需要修改模型返回融合后的特征
-                # 为简单起见，我们直接在评估时重新计算融合特征
-                
-                # --- 重复模型内部逻辑来获取融合特征 ---
-                image_feat = model.encode_image(batch['image'].to(device))
-                candidate_feat_tokens, candidate_mask = model.encode_text_tokens(batch['candidate_ids'].to(device))
-                if batch['emotion_input_ids'] is not None:
-                    emotion_feat_bert = model.encode_emotion(batch['emotion_input_ids'].to(device), batch['emotion_attention_mask'].to(device))
-                    projected_emotion_feat = model.emotion_projection(emotion_feat_bert.type(model.emotion_projection.weight.dtype))
-                    image_feat = image_feat + projected_emotion_feat
-                image_feat_seq = F.normalize(image_feat, dim=-1).unsqueeze(1)
-                image_mask_for_attention = torch.ones(image_feat_seq.size(0), 1, 1, 1).to(device)
-                
-                fused_image_feat, _ = model.co_attention(
-                    image_feat_seq, image_mask_for_attention,
-                    candidate_feat_tokens, candidate_mask
-                )
-                final_fused_feat = fused_image_feat.squeeze(1)
-                all_target_feats.append(final_fused_feat.cpu())
+                # 直接使用模型返回的融合特征，无需重复计算
+                all_target_feats.append(fused_feat.cpu())
 
-        elif stage == 2: # 评估 QC 分支 (逻辑不变，本身就是高效的)
+        elif stage == 2: # 评估 QC 分支 (使用return_features保持一致性)
             for batch in tqdm(test_dataloader, desc="Caching QC Features"):
-                candidate_ids = batch['candidate_ids'].to(device)
-                c_feat = model.encode_text_pooled(candidate_ids)
-                all_target_feats.append(c_feat.cpu())
+                query_feat, candidate_feat = model(
+                    query_ids=batch['query_ids'].to(device),
+                    candidate_ids=batch['candidate_ids'].to(device),
+                    image=batch['image'].to(device),  # QC不需要图片，但为了保持接口一致
+                    emotion_ids=batch['emotion_input_ids'].to(device),
+                    emotion_mask=batch['emotion_attention_mask'].to(device),
+                    training_stage='stage2_qc',
+                    return_features=True
+                )
+                # 直接使用模型返回的特征，保持与QI分支的一致性
+                all_target_feats.append(candidate_feat.cpu())
         
         all_target_feats = torch.cat(all_target_feats, dim=0)
 
@@ -118,7 +104,6 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
     sim_matrix = torch.matmul(all_q_feats, all_target_feats.t())
     
     # 4. R@k 计算和详细打印逻辑 (与之前相同)
-    # ... (省略与上一版完全相同的 R@k 计算和打印代码) ...
     print("\n--- Computing R@k & Detailed Predictions ---")
     num_queries = sim_matrix.shape[0]
     recalls = {}
@@ -144,6 +129,7 @@ def eval_epoch(model, test_dataset, test_dataloader, device, stage, print_n_samp
     return recalls
 
 def main(args):
+    print(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -157,7 +143,6 @@ def main(args):
     model.to(device)
     
     train_dataset = MSRVTT_Dataset(
-        # ... (数据加载参数与之前相同) ...
         csv_path=os.path.join(args.data_path, args.train_csv),
         json_path=os.path.join(args.data_path, args.train_json),
         features_path=args.image_path,
@@ -170,7 +155,6 @@ def main(args):
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     
     test_dataset = MSRVTT_Dataset(
-        # ... (测试数据加载参数与之前相同) ...
         csv_path=os.path.join(args.data_path, args.test_json),
         json_path=os.path.join(args.data_path, args.test_json),
         features_path=args.image_path,
@@ -182,8 +166,7 @@ def main(args):
     )
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    # 2. 优化器 (与之前相同)
-    # ... (省略与之前相同的 optimizer 定义代码) ...
+    # 2. 优化器 
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr * args.coef_lr},
