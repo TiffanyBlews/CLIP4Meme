@@ -11,6 +11,9 @@ from tqdm import tqdm
 import os
 import argparse
 from collections import defaultdict
+import wandb
+import yaml
+from datetime import datetime
 
 from model import CLIP4Meme
 from dataset import MSRVTT_Dataset
@@ -24,14 +27,163 @@ CONFIG = {
     "test_json": "test_data.json",
     "test_emotion_json": "test_emotion.json",
     
-    "batch_size": 64, "epochs": 20, "lr": 5e-4, "coef_lr": 1e-3,
+    "batch_size": 64, "epochs": 20, "lr": 1e-4, "coef_lr": 1e-3,
     "weight_decay": 0.01, "min_lr": 0,
     
     "pretrained_clip_name": "ViT-B/32", "use_emotion_fusion": True, "seed": 42,
 
     "save_dir": "./checkpoints_imgflip",
-    "checkpoint_path": "./checkpoints_imgflip/stage2_qc_best.pth"
+    "checkpoint_path": "checkpoints_imgflip/qi.pth",
+    
+    # wandb配置
+    "wandb_project": "clip4meme",
+    "wandb_entity": None,  # 设置为你的wandb用户名或团队名
+    "wandb_tags": [],
+    "wandb_notes": "",
+    "log_gradients": False,  # 是否记录梯度
+    "log_model": False,  # 是否上传模型到wandb
 }
+
+def setup_wandb(args):
+    """设置wandb实验"""
+    # 设置wandb国内镜像
+    # os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
+    
+    # 构建实验名称
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_name = f"{args.train.upper()}_{args.pretrained_clip_name}_{timestamp}"
+    
+    # 构建标签
+    tags = args.wandb_tags + [args.train.upper(), args.pretrained_clip_name]
+    # 初始化wandb
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=experiment_name,
+        tags=tags,
+        notes=args.wandb_notes,
+        config=vars(args),
+        mode="online" if args.wandb_project else "disabled"
+    )
+    
+    print(f"Wandb initialized: {wandb.run.name}")
+    return wandb.run
+
+def log_hyperparameters(args, model):
+    """记录超参数和模型信息"""
+    # 记录模型参数数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    wandb.config.update({
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+        "model_architecture": model.__class__.__name__,
+        "clip_model": args.pretrained_clip_name,
+    })
+    
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+def log_metrics(epoch, train_loss, eval_results, learning_rate, branch_name, total_batches):
+    """记录训练和评估指标"""
+    # 使用全局step来确保单调递增，基于实际batch数量
+    global_step = epoch * (total_batches + 1)  # +1为epoch指标预留空间
+    
+    metrics = {
+        f"{branch_name.lower()}/epoch": epoch,
+        f"{branch_name.lower()}/train_loss": train_loss,
+        f"{branch_name.lower()}/learning_rate": learning_rate,
+    }
+    
+    # 添加评估指标
+    for k, v in eval_results.items():
+        metrics[f"{branch_name.lower()}/{k.lower()}"] = v
+    
+    # 使用全局step记录指标
+    wandb.log(metrics, step=global_step)
+    
+    # 打印指标
+    print(f"\n--- Epoch {epoch} Metrics ---")
+    print(f"Train Loss: {train_loss:.4f}")
+    print(f"Learning Rate: {learning_rate:.6f}")
+    for k, v in eval_results.items():
+        print(f"{k}: {v:.2f}%")
+
+def log_predictions(epoch, model, test_dataset, test_dataloader, device, branch_name, total_batches, num_samples=5):
+    """记录预测样本到wandb"""
+    if num_samples <= 0:
+        return
+    
+    # 使用全局step来确保单调递增，基于实际batch数量
+    global_step = epoch * (total_batches + 1)
+    
+    model.eval()
+    samples = []
+    
+    with torch.no_grad():
+        for i, batch in enumerate(test_dataloader):
+            if i >= num_samples:
+                break
+                
+            query_ids = batch['query_ids'].to(device)
+            candidate_ids = batch['candidate_ids'].to(device)
+            image = batch['image'].to(device)
+            emotion_ids = batch['emotion_input_ids'].to(device)
+            emotion_mask = batch['emotion_attention_mask'].to(device)
+            
+            # 获取预测
+            if branch_name.lower() == 'qi':
+                query_feat, fused_feat = model(
+                    query_ids=query_ids,
+                    candidate_ids=candidate_ids,
+                    image=image,
+                    emotion_ids=emotion_ids,
+                    emotion_mask=emotion_mask,
+                    branch='qi',
+                    return_features=True
+                )
+            else:
+                query_feat, candidate_feat = model(
+                    query_ids=query_ids,
+                    candidate_ids=candidate_ids,
+                    image=image,
+                    emotion_ids=emotion_ids,
+                    emotion_mask=emotion_mask,
+                    branch='qc',
+                    return_features=True
+                )
+            
+            # 计算相似度
+            sim_matrix = torch.matmul(F.normalize(query_feat, dim=-1), 
+                                    F.normalize(fused_feat if branch_name.lower() == 'qi' else candidate_feat, dim=-1).t())
+            
+            # 获取top-3预测
+            top3_indices = torch.topk(sim_matrix[0], k=3).indices
+            top3_scores = torch.topk(sim_matrix[0], k=3).values
+            
+            # 构建样本记录
+            sample = {
+                "epoch": epoch,
+                "branch": branch_name,
+                "query_text": test_dataset.data[i]['query'],
+                "ground_truth": test_dataset.data[i]['candidate_texts'][0] if test_dataset.data[i]['candidate_texts'] else "",
+                "top1_prediction": test_dataset.data[top3_indices[0]]['candidate_texts'][0] if test_dataset.data[top3_indices[0]]['candidate_texts'] else "",
+                "top1_score": float(top3_scores[0]),
+                "top2_prediction": test_dataset.data[top3_indices[1]]['candidate_texts'][0] if test_dataset.data[top3_indices[1]]['candidate_texts'] else "",
+                "top2_score": float(top3_scores[1]),
+                "top3_prediction": test_dataset.data[top3_indices[2]]['candidate_texts'][0] if test_dataset.data[top3_indices[2]]['candidate_texts'] else "",
+                "top3_score": float(top3_scores[2]),
+            }
+            samples.append(sample)
+    
+    # 记录到wandb
+    if samples:
+        # 创建wandb表格，指定列名
+        columns = ["epoch", "branch", "query_text", "ground_truth", "top1_prediction", "top1_score", 
+                  "top2_prediction", "top2_score", "top3_prediction", "top3_score"]
+        table = wandb.Table(columns=columns, data=[[s[col] for col in columns] for s in samples])
+        wandb.log({f"{branch_name.lower()}/predictions": table}, step=global_step)
 
 def symmetric_contrastive_loss(sim_matrix):
     labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
@@ -134,9 +286,15 @@ def main(args):
     branch_name = args.train.upper()
     print(f"--- Starting Training for {branch_name} branch ---")
 
-    # 1. 初始化模型和数据
+    # 1. 初始化wandb
+    wandb_run = setup_wandb(args)
+    
+    # 2. 初始化模型和数据
     model = CLIP4Meme(pretrained_clip_name=args.pretrained_clip_name)
     model.to(device)
+    
+    # 记录模型超参数
+    log_hyperparameters(args, model)
     
     train_dataset = MSRVTT_Dataset(
         csv_path=os.path.join(args.data_path, args.train_csv),
@@ -164,11 +322,14 @@ def main(args):
 
     # 2. 优化器 
     no_decay = ["bias", "LayerNorm.weight"]
+    
+    # 冻结BERT模型参数
+    for param in model.bert_model.parameters():
+        param.requires_grad = False
+    
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr * args.coef_lr},
         {'params': [p for n, p in model.clip.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': args.lr * args.coef_lr},
-        {'params': [p for n, p in model.bert_model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': 0 if args.train.lower() == 'qc' else args.lr * args.coef_lr},
-        {'params': [p for n, p in model.bert_model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': 0 if args.train.lower() == 'qc' else args.lr * args.coef_lr},
         {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr},
         {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': args.lr}
     ]
@@ -176,18 +337,23 @@ def main(args):
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
     # 3. 加载检查点 (QI和QC分支共享相同的检查点)
-    if os.path.exists(args.checkpoint_path):
+    if hasattr(args, 'checkpoint_path') and args.checkpoint_path and os.path.exists(args.checkpoint_path):
         print(f"--- Loading checkpoint for {branch_name} branch training ---")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
-        print("--- No checkpoint found, starting from scratch ---")
+        print("--- No checkpoint provided, starting from scratch ---")
 
     # 4. 训练循环
     best_r1 = 0.0
+    epoch_losses = []
+    
     for epoch in range(args.epochs):
         model.train()
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs} [{branch_name}]")
+        epoch_loss = 0.0
+        num_batches = 0
+        
         for batch in pbar:
             optimizer.zero_grad()
             
@@ -203,27 +369,88 @@ def main(args):
             
             loss = symmetric_contrastive_loss(sim_matrix)
             loss.backward()
+            
+            # 记录梯度（如果启用）
+            if args.log_gradients:
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        wandb.log({f"gradients/{name}": wandb.Histogram(param.grad.cpu().numpy())}, step=epoch * len(train_dataloader) + num_batches)
+            
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
             pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            
+            # 记录每个batch的loss
+            batch_step = epoch * (len(train_dataloader) + 1) + num_batches  # 基于实际batch数量
+            wandb.log({f"{branch_name.lower()}/batch_loss": loss.item()}, step=batch_step)
         
+        # 计算平均epoch loss
+        avg_epoch_loss = epoch_loss / num_batches
+        epoch_losses.append(avg_epoch_loss)
+        
+        # 获取当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
         scheduler.step()
         
         # 评估和保存
         eval_results = eval_epoch(model, test_dataset, test_dataloader, device, branch_name)
+        
+        # 记录指标到wandb
+        log_metrics(epoch + 1, avg_epoch_loss, eval_results, current_lr, branch_name, len(train_dataloader))
+        
+        # 记录预测样本（每5个epoch记录一次）
+        if (epoch + 1) % 5 == 0:
+            log_predictions(epoch + 1, model, test_dataset, test_dataloader, device, branch_name, len(train_dataloader), num_samples=3)
+        
+        # 保存最佳模型
         if eval_results.get('R@1', 0) > best_r1:
             best_r1 = eval_results.get('R@1', 0)
             
-            # 构建新的检查点文件名：原文件名 + 当前分支名
-            base_name = os.path.splitext(os.path.basename(args.checkpoint_path))[0]
-            if base_name == "checkpoint":  # 如果是默认名称，直接使用分支名
+            # 构建新的检查点文件名
+            if hasattr(args, 'checkpoint_path') and args.checkpoint_path:
+                # 如果有检查点路径，在原文件名后添加分支名
+                base_name = os.path.splitext(os.path.basename(args.checkpoint_path))[0]
+                if base_name == "checkpoint":  # 如果是默认名称，直接使用分支名
+                    new_checkpoint_name = f"{branch_name.lower()}.pth"
+                else:  # 否则在原文件名后添加当前分支名
+                    new_checkpoint_name = f"{base_name}_{branch_name.lower()}.pth"
+            else:
+                # 如果没有检查点路径，直接使用分支名
                 new_checkpoint_name = f"{branch_name.lower()}.pth"
-            else:  # 否则在原文件名后添加当前分支名
-                new_checkpoint_name = f"{base_name}_{branch_name.lower()}.pth"
             
             save_path = os.path.join(args.save_dir, new_checkpoint_name)
             print(f"*** New best R@1: {best_r1:.2f}%. Saving model to {save_path} ***")
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict()}, save_path)
+            
+            # 保存模型检查点
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_r1': best_r1,
+                'config': vars(args)
+            }
+            torch.save(checkpoint, save_path)
+            
+            # 上传模型到wandb（如果启用）
+            if args.log_model:
+                wandb.save(save_path)
+                print(f"Model uploaded to wandb: {save_path}")
+    
+    # 训练结束后记录最终结果
+    print(f"\n--- Training Completed ---")
+    print(f"Best R@1: {best_r1:.2f}%")
+    
+    # 记录训练完成
+    final_step = args.epochs * (len(train_dataloader) + 1)
+    wandb.log({f"{branch_name.lower()}/best_r1": best_r1}, step=final_step)
+    wandb.log({f"{branch_name.lower()}/training_completed": True}, step=final_step)
+    
+    # 关闭wandb
+    wandb.finish()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Meme-Retrieval model based on QI/QC branches.")

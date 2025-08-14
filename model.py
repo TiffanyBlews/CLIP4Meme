@@ -19,6 +19,11 @@ class CLIP4Meme(nn.Module):
         self.clip, self.clip_preprocess = clip.load(pretrained_clip_name, device='cpu', jit=False)
         self.bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
         self.bert_model = BertModel.from_pretrained(bert_model_name)
+        
+        # 冻结BERT模型参数
+        for param in self.bert_model.parameters():
+            param.requires_grad = False
+        
         clip_feature_dim = self.clip.visual.output_dim
         bert_feature_dim = self.bert_model.config.hidden_size
         self.emotion_projection = nn.Linear(bert_feature_dim, clip_feature_dim)
@@ -167,3 +172,122 @@ class CLIP4Meme(nn.Module):
             fused_sim = (alpha * qi_sim + (1 - alpha) * qc_sim) / temperature
             
             return fused_sim, qi_sim, qc_sim
+
+    def hierarchical_retrieval(self, 
+                              query_ids, 
+                              candidate_ids, 
+                              image, 
+                              emotion_ids=None, 
+                              emotion_mask=None,
+                              coarse_k: int = 100,
+                              alpha: float = 0.6,
+                              temperature: float = 0.07):
+        """
+        分层检索：粗召回 + 精排序
+        
+        Args:
+            coarse_k: 粗召回阶段选择的候选数量
+            alpha: QI分支权重，QC分支权重为(1-alpha)
+            temperature: 温度参数
+        
+        Returns:
+            final_scores: 最终融合分数
+            top_k_indices: 粗召回阶段的Top-K索引
+            qc_sim: QC分支相似度矩阵
+            qi_sim: QI分支相似度矩阵
+        """
+        with torch.no_grad():
+            # 阶段1：粗召回 (QC分支) - 纯文本匹配，速度快
+            qc_sim = self.forward(
+                query_ids=query_ids,
+                candidate_ids=candidate_ids,
+                image=image,
+                emotion_ids=emotion_ids,
+                emotion_mask=emotion_mask,
+                branch='qc'
+            )
+            
+            # 选择Top-K候选进行精排序
+            top_k_values, top_k_indices = torch.topk(qc_sim, k=coarse_k, dim=-1)
+            
+            # 阶段2：精排序 (QI分支) - 仅在粗召回结果上计算
+            qi_sim = self.forward(
+                query_ids=query_ids,
+                candidate_ids=candidate_ids,
+                image=image,
+                emotion_ids=emotion_ids,
+                emotion_mask=emotion_mask,
+                branch='qi'
+            )
+            
+            # 融合排序：结合粗召回和精排序的结果
+            final_scores = alpha * qi_sim + (1 - alpha) * qc_sim
+            
+            return final_scores, top_k_indices, qc_sim, qi_sim
+
+    def hierarchical_retrieval_efficient(self, 
+                                       query_ids, 
+                                       candidate_ids, 
+                                       image, 
+                                       emotion_ids=None, 
+                                       emotion_mask=None,
+                                       coarse_k: int = 100,
+                                       alpha: float = 0.6,
+                                       temperature: float = 0.07):
+        """
+        高效分层检索：避免重复计算，优化内存使用
+        
+        Args:
+            coarse_k: 粗召回阶段选择的候选数量
+            alpha: QI分支权重，QC分支权重为(1-alpha)
+            temperature: 温度参数
+        
+        Returns:
+            final_scores: 最终融合分数
+            top_k_indices: 粗召回阶段的Top-K索引
+            qc_sim: QC分支相似度矩阵
+            qi_sim: QI分支相似度矩阵（仅在粗召回候选上计算）
+        """
+        with torch.no_grad():
+            # 阶段1：粗召回 (QC分支)
+            qc_sim = self.forward(
+                query_ids=query_ids,
+                candidate_ids=candidate_ids,
+                image=image,
+                emotion_ids=emotion_ids,
+                emotion_mask=emotion_mask,
+                branch='qc'
+            )
+            
+            # 选择Top-K候选
+            top_k_values, top_k_indices = torch.topk(qc_sim, k=coarse_k, dim=-1)
+            
+            # 阶段2：精排序 (QI分支) - 仅在粗召回结果上计算
+            # 这里需要重新组织数据，只计算Top-K候选的QI相似度
+            batch_size = query_ids.size(0)
+            
+            # 创建新的candidate_ids，只包含粗召回的结果
+            selected_candidate_ids = torch.gather(
+                candidate_ids, 
+                1, 
+                top_k_indices.unsqueeze(-1).expand(-1, -1, candidate_ids.size(-1))
+            )
+            
+            # 计算QI相似度（仅在粗召回候选上）
+            qi_sim_selected = self.forward(
+                query_ids=query_ids,
+                candidate_ids=selected_candidate_ids,
+                image=image,
+                emotion_ids=emotion_ids,
+                emotion_mask=emotion_mask,
+                branch='qi'
+            )
+            
+            # 创建完整的QI相似度矩阵，未选中的位置填充负无穷
+            qi_sim_full = torch.full_like(qc_sim, float('-inf'))
+            qi_sim_full.scatter_(1, top_k_indices, qi_sim_selected)
+            
+            # 融合排序
+            final_scores = alpha * qi_sim_full + (1 - alpha) * qc_sim
+            
+            return final_scores, top_k_indices, qc_sim, qi_sim_full

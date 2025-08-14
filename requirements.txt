@@ -6,4 +6,7 @@ tqdm
 ftfy
 regex
 Pillow
+numpy
+wandb
+PyYAML
 git+https://github.com/openai/CLIP.git

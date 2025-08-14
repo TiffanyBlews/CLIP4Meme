@@ -1,4 +1,5 @@
 # CLIP4Meme: 基于CLIP的Meme图片推荐系统
+Inspired by [CLIP4Clip](https://github.com/ArrowLuo/CLIP4Clip), [Cap4Video](https://github.com/whwu95/Cap4Video) and [EFB](https://github.com/colalikerlovely/A-Benchmark-for-Cross-Modal-Emotion-Infused-Internet-Meme-Recommendation)
 
 ## 项目简介
 
