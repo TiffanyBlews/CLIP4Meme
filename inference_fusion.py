@@ -8,17 +8,47 @@ from collections import defaultdict
 from tqdm import tqdm
 import argparse
 import os
+import random
 
 from model import CLIP4Meme
 from dataset import MSRVTT_Dataset
 from torch.utils.data import DataLoader
+
+def set_seed(seed=42):
+    """
+    设置随机种子以确保结果可重现
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # 检查CUDA是否可用
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # 设置CUDA确定性选项
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"CUDA deterministic mode enabled")
+    
+    # 设置环境变量
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    
+    print(f"Random seed set to {seed} for reproducibility")
+    print(f"Note: For complete reproducibility, ensure same hardware and software environment")
 
 def evaluate_fusion(model, test_dataset, test_dataloader, device, 
                    alpha=0.6, temperature=0.05, print_n_samples=5):
     """
     评估融合方法的性能
     """
+    # 确保模型处于评估模式
     model.eval()
+    
+    # 额外的确定性设置
+    torch.use_deterministic_algorithms(True)
+    
     print(f"\n--- Evaluating Fusion Method (α={alpha:.1f}, QI:{alpha:.1f} + QC:{1-alpha:.1f}) ---")
     
     # 1. 收集元数据
@@ -133,6 +163,14 @@ def compare_multiple_alphas(model, test_dataset, test_dataloader, device, alphas
     """
     比较多个alpha值的性能，包括单独使用QI分支(α=1.0)和QC分支(α=0.0)
     """
+    # 额外的确定性设置
+    if hasattr(torch, 'use_deterministic_algorithms'):
+        try:
+            torch.use_deterministic_algorithms(True)
+            print("PyTorch deterministic algorithms enabled")
+        except:
+            print("Warning: Could not enable deterministic algorithms")
+    
     print("\n" + "="*80)
     print("COMPARING MULTIPLE ALPHA VALUES")
     print("="*80)
@@ -277,13 +315,13 @@ def main():
     parser.add_argument('--data_path', type=str, default="/root/zt/imgflip_results/msrvtt",
                        help="Path to data directory")
     parser.add_argument('--image_path', type=str, default="/root/zt/imgflip_results/images",
-    #                    help="Path to image directory")
+                       help="Path to image directory")
     # parser.add_argument('--checkpoint', type=str, default="checkpoints_douban/stage2_qc_best.pth",
     #                    help="Path to model checkpoint")
     # parser.add_argument('--data_path', type=str, default="/root/zt/data_topics/input_file",
     #                    help="Path to data directory")
     # parser.add_argument('--image_path', type=str, default="/root/zt/data_topics/image",
-                       help="Path to image directory")
+                    #    help="Path to image directory")
     parser.add_argument('--test_json', type=str, default="test_data.json",
                        help="Test JSON file")
     parser.add_argument('--test_emotion_json', type=str, default="test_emotion.json",
@@ -293,12 +331,17 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.8,
                        help="Weight α for QI branch in fusion: Final = α×QI + (1-α)×QC")
     parser.add_argument('--alphas', nargs='+', type=float, 
-                       default=[0.0, 0.2, 0.5, 0.8, 0.9 ,1.0],
+                       default=[0.0, 0.2, 0.5, 0.8, 0.85 ,1.0],
                        help="Multiple alpha values to test (space-separated)")
     parser.add_argument('--multi_alpha', action='store_true', default=False,
                        help="Test multiple alpha values and compare")
+    parser.add_argument('--seed', type=int, default=114514,
+                       help="Random seed for reproducibility")
     
     args = parser.parse_args()
+    
+    # 设置随机种子以确保结果可重现
+    set_seed(args.seed)
     
     # 检查checkpoint文件
     if not os.path.exists(args.checkpoint):
@@ -328,7 +371,8 @@ def main():
         is_train=False,
         load_image=True
     )
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    # 使用num_workers=0确保确定性，避免多进程导致的随机性
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     
     # 4. 执行推理
     if args.multi_alpha:

@@ -9,8 +9,8 @@ import numpy as np
 import math
 
 # ====================================================================================
-#  从 clip4clip 移植过来的 Co-attention 模块及其依赖项
-#  source: https://github.com/ArrowLuo/CLIP4Clip/tree/master/modules
+#  从 Cap4Video 移植过来的 Co-attention 模块及其依赖项
+#  source: https://github.com/whwu95/Cap4Video/tree/main/modules
 # ====================================================================================
 
 class BertBiAttention(nn.Module):
