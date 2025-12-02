@@ -210,3 +210,5 @@ __marimo__/
 start_env.sh
 wandb
 checkpoints*
+data/*
+imgflip_data/*
