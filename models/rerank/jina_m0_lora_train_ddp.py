@@ -367,7 +367,7 @@ def score_batch(model, processor, texts, images, device, requires_grad=False):
             if requires_grad:
                 if mdl_dev.type == "cuda":
                     from torch import amp as _amp
-                    with _amp.autocast("cuda", dtype=torch.float16):
+                    with _amp.autocast("cuda", dtype=torch.bfloat16):  # 使用 bfloat16 与模型 dtype 一致
                         with torch.set_grad_enabled(True):
                             logits = model(**inputs)
                 else:
@@ -377,7 +377,7 @@ def score_batch(model, processor, texts, images, device, requires_grad=False):
                 with torch.inference_mode():
                     if mdl_dev.type == "cuda":
                         from torch import amp as _amp
-                        with _amp.autocast("cuda", dtype=torch.float16):
+                        with _amp.autocast("cuda", dtype=torch.bfloat16):  # 使用 bfloat16 与模型 dtype 一致
                             logits = model(**inputs)
                     else:
                         logits = model(**inputs)
@@ -428,7 +428,7 @@ def score_batch(model, processor, texts, images, device, requires_grad=False):
         if requires_grad:
             if mdl_dev.type == "cuda":
                 from torch import amp as _amp
-                with _amp.autocast("cuda", dtype=torch.float16):
+                with _amp.autocast("cuda", dtype=torch.bfloat16):  # 使用 bfloat16 与模型 dtype 一致
                     with torch.set_grad_enabled(True):
                         out = model(**inputs)
             else:
@@ -438,7 +438,7 @@ def score_batch(model, processor, texts, images, device, requires_grad=False):
             with torch.inference_mode():
                 if mdl_dev.type == "cuda":
                     from torch import amp as _amp
-                    with _amp.autocast("cuda", dtype=torch.float16):
+                    with _amp.autocast("cuda", dtype=torch.bfloat16):  # 使用 bfloat16 与模型 dtype 一致
                         out = model(**inputs)
                 else:
                     out = model(**inputs)
@@ -886,20 +886,35 @@ def train(args=None):
     
     cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     # 在 DDP 训练中，每个进程都会加载模型
-    # 重要：不要使用 device_map，因为 Accelerate 会管理设备分配
-    # 使用 low_cpu_mem_usage=True 和 max_memory 来限制显存使用
-    print_main(f"[Model] Loading model on CPU first (will be moved to GPU by Accelerate)")
+    # 关键优化：
+    # 1. 使用 low_cpu_mem_usage=True 减少 CPU 内存占用
+    # 2. 先加载到 CPU，避免在加载时就在 GPU 上分配显存
+    # 3. Accelerate 会在 prepare() 时将其移到正确的 GPU
+    print_main(f"[Model] Loading model (process {accelerator.process_index}/{accelerator.num_processes})")
+    print_main(f"[Model] Note: Each process loads a full model copy in DDP mode")
+    
+    # 在加载前清理显存（如果有残留）
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     base_model = JinaVLForRanking.from_pretrained(
         model_name,
         config=cfg,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,  # 使用 bfloat16 与单卡版本一致，数值范围与 float32 相同，训练更稳定
         trust_remote_code=True,
         low_cpu_mem_usage=True,  # 多卡时减少内存
         # 注意：不要使用 device_map，让 Accelerate 管理设备分配
     )
+    
     # 确保模型在 CPU 上（Accelerate 会将其移到正确的 GPU）
+    # 这样可以避免在加载时就在所有 GPU 上分配显存
     base_model = base_model.cpu()
-    print_main(f"[Model] Model loaded on CPU, will be moved to GPU by Accelerate")
+    
+    # 再次清理显存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    print_main(f"[Model] Model loaded on CPU, will be moved to GPU {accelerator.process_index} by Accelerate")
     
     train_lora = bool(getattr(args, "train_lora", True)) if args is not None else True
     
@@ -1074,7 +1089,17 @@ def train(args=None):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tmax, eta_min=min_lr)
     
     # ============ 使用 Accelerator 准备模型和优化器 ============
+    # 在 prepare 之前，确保所有进程都完成了模型加载
+    accelerator.wait_for_everyone()
+    
+    print_main(f"[Accelerate] Preparing model for GPU {accelerator.process_index}...")
     model, opt, scheduler = accelerator.prepare(model, opt, scheduler)
+    
+    # 准备后清理一次显存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    print_main(f"[Accelerate] Model prepared and moved to GPU {accelerator.process_index}")
     
     # ============ 如果使用 gradient checkpointing，设置静态图以支持 DDP ============
     if use_grad_checkpointing:
