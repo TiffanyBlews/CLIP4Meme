@@ -212,3 +212,7 @@ wandb
 checkpoints*
 data/*
 imgflip_data/*
+logs
+external
+clip_douban
+.trae

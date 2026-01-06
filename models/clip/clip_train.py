@@ -2,19 +2,21 @@
 # 简化的CLIP训练脚本，直接使用现有配置
 
 import torch
-from transformers import CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel, BertModel
 from torch.utils.data import DataLoader
 import os
 import clip
 import numpy as np
 from torch.nn.utils import clip_grad_norm_
 import torch.nn.functional as F
+import torch.nn as nn
 from tqdm import tqdm
+import wandb
 
 # 导入现有的数据集类
 import sys
 import os
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.append(project_root)
 from dataset import MSRVTT_Dataset
@@ -22,8 +24,10 @@ from dataset import MSRVTT_Dataset
 # 简化的CLIP训练配置，参考run.py的超参数
 CONFIG = {
     # 数据路径
-    "data_path": "./data/input_file",
-    "image_path": "./data/image",
+    # "data_path": "./data/input_file",
+    # "image_path": "./data/image",
+    "data_path": "./imgflip_data/msrvtt",
+    "image_path": "./imgflip_data/images",
     "train_csv": "train_ids.csv",
     "train_json": "train_data.json",
     "train_emotion_json": "train_emotion.json",
@@ -32,8 +36,8 @@ CONFIG = {
     
     # 训练超参数（参考run.py）
     "batch_size": 128,
-    "epochs": 10,
-    "lr": 1e-5,
+    "epochs": 5,
+    "lr": 5e-6,
     "max_grad_norm": 1.0,
     
     # 模型配置
@@ -42,8 +46,34 @@ CONFIG = {
     
     # 保存配置
     "save_dir": "./checkpoints_clip",
-    "model_save_name": "clip_best_model.pt",
+    "model_save_name": "clip_imgflip.pt",
+    "use_image_emotion_fusion": False,
+    "use_text_emotion_fusion": False,
+    "use_multi_positive_loss": True,
+    "wandb_project": "clip4meme",
+    "wandb_entity": "",
+    "log_model": False,
 }
+
+class EmotionAdapter(nn.Module):
+    def __init__(self, emo_dim=768, clip_dim=512):
+        super().__init__()
+        self.bert = BertModel.from_pretrained("bert-base-chinese")
+        self.proj = nn.Sequential(
+            nn.Linear(emo_dim, clip_dim),
+            nn.ReLU(),
+            nn.Linear(clip_dim, clip_dim)
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(clip_dim * 2, 1),
+            nn.Sigmoid()
+        )
+    def emotion_proj(self, emotion_ids, emotion_mask):
+        emo_feat = self.bert(emotion_ids, attention_mask=emotion_mask).pooler_output
+        return self.proj(emo_feat)
+    def fuse(self, base_feat, emo_proj):
+        g = self.gate(torch.cat([base_feat, emo_proj], dim=-1))
+        return base_feat + g * emo_proj
 
 def compute_simple_metrics(similarity_matrix, all_captions_meta):
     """计算简单的检索指标，基于相同query的正样本"""
@@ -55,7 +85,6 @@ def compute_simple_metrics(similarity_matrix, all_captions_meta):
     for idx, cap in enumerate(all_captions_meta):
         caption_to_indices[cap].append(idx)
     
-    # 计算R@1
     r1_correct = 0
     for q_idx in range(total_samples):
         top1_idx = np.argmax(similarity_matrix[q_idx])
@@ -64,7 +93,6 @@ def compute_simple_metrics(similarity_matrix, all_captions_meta):
             r1_correct += 1
     r1 = (r1_correct / total_samples) * 100
     
-    # 计算R@5
     r5_correct = 0
     for q_idx in range(total_samples):
         top5_indices = np.argsort(similarity_matrix[q_idx])[-5:]
@@ -73,9 +101,40 @@ def compute_simple_metrics(similarity_matrix, all_captions_meta):
             r5_correct += 1
     r5 = (r5_correct / total_samples) * 100
     
-    return {"R@1": r1, "R@5": r5}
+    p1_acc = 0.0
+    p5_acc = 0.0
+    for q_idx in range(total_samples):
+        top1_indices = np.argsort(similarity_matrix[q_idx])[-1:]
+        gt_indices = caption_to_indices[all_captions_meta[q_idx]]
+        correct1 = sum(1 for p in top1_indices if p in gt_indices)
+        p1_acc += correct1 / 1.0
+        top5_indices = np.argsort(similarity_matrix[q_idx])[-5:]
+        correct5 = sum(1 for p in top5_indices if p in gt_indices)
+        p5_acc += correct5 / 5.0
+    p1 = (p1_acc / total_samples) * 100
+    p5 = (p5_acc / total_samples) * 100
+    
+    return {"R@1": r1, "R@5": r5, "P@1": p1, "P@5": p5}
 
-def evaluate_simple(model, dataloader, device, dataset, clip_model):
+def multi_positive_contrastive_loss(sim_matrix, captions):
+    B = sim_matrix.size(0)
+    device = sim_matrix.device
+    pos_mask = torch.zeros((B, B), dtype=torch.bool, device=device)
+    for i in range(B):
+        for j in range(B):
+            if captions[i] == captions[j]:
+                pos_mask[i, j] = True
+    log_prob = F.log_softmax(sim_matrix, dim=1)
+    pos_counts = pos_mask.sum(dim=1).clamp(min=1)
+    pos_log_prob_sum = (log_prob.masked_fill(~pos_mask, 0.0)).sum(dim=1)
+    loss_row = -(pos_log_prob_sum / pos_counts)
+    log_prob_T = F.log_softmax(sim_matrix.t(), dim=1)
+    pos_counts_T = pos_mask.t().sum(dim=1).clamp(min=1)
+    pos_log_prob_sum_T = (log_prob_T.masked_fill(~pos_mask.t(), 0.0)).sum(dim=1)
+    loss_col = -(pos_log_prob_sum_T / pos_counts_T)
+    return (loss_row.mean() + loss_col.mean()) / 2
+
+def evaluate_simple(model, dataloader, device, dataset, clip_model, emotion_adapter=None):
     """简单评估"""
     model.eval()
     text_features_list = []
@@ -91,6 +150,14 @@ def evaluate_simple(model, dataloader, device, dataset, clip_model):
             # 获取特征（使用OpenAI CLIP，保证预处理/分词一致）
             image_features = clip_model.encode_image(images)
             text_features = clip_model.encode_text(query_ids)
+            if CONFIG["use_image_emotion_fusion"] or CONFIG["use_text_emotion_fusion"]:
+                emotion_ids = batch["emotion_input_ids"].to(device)
+                emotion_mask = batch["emotion_attention_mask"].to(device)
+                emo_proj = emotion_adapter.emotion_proj(emotion_ids, emotion_mask)
+                if CONFIG["use_image_emotion_fusion"]:
+                    image_features = emotion_adapter.fuse(image_features, emo_proj)
+                if CONFIG["use_text_emotion_fusion"]:
+                    text_features = emotion_adapter.fuse(text_features, emo_proj)
             image_norm = image_features.norm(dim=1, keepdim=True).clamp(min=1e-6)
             text_norm = text_features.norm(dim=1, keepdim=True).clamp(min=1e-6)
             image_features = image_features / image_norm
@@ -114,9 +181,12 @@ def evaluate_simple(model, dataloader, device, dataset, clip_model):
     
     return metrics, similarity_matrix
 
-def train_simple_clip(train_loader, test_loader, model, device, test_dataset, clip_model):
+def train_simple_clip(train_loader, test_loader, model, device, test_dataset, clip_model, emotion_adapter=None, use_multi_positive_loss=False, wandb_enabled=False):
     """简单训练CLIP模型"""
-    optimizer = torch.optim.Adam(clip_model.parameters(), lr=CONFIG["lr"])
+    if emotion_adapter is not None:
+        optimizer = torch.optim.Adam(list(clip_model.parameters()) + list(emotion_adapter.parameters()), lr=CONFIG["lr"])
+    else:
+        optimizer = torch.optim.Adam(clip_model.parameters(), lr=CONFIG["lr"])
     best_r1 = 0
     
     print(f"开始训练，共{CONFIG['epochs']}个epoch...")
@@ -138,6 +208,14 @@ def train_simple_clip(train_loader, test_loader, model, device, test_dataset, cl
             # 获取特征（使用OpenAI CLIP，与数据集tokenizer/预处理保持一致）
             image_features = clip_model.encode_image(images)
             text_features = clip_model.encode_text(query_ids)
+            if CONFIG["use_image_emotion_fusion"] or CONFIG["use_text_emotion_fusion"]:
+                emotion_ids = batch["emotion_input_ids"].to(device)
+                emotion_mask = batch["emotion_attention_mask"].to(device)
+                emo_proj = emotion_adapter.emotion_proj(emotion_ids, emotion_mask)
+                if CONFIG["use_image_emotion_fusion"]:
+                    image_features = emotion_adapter.fuse(image_features, emo_proj)
+                if CONFIG["use_text_emotion_fusion"]:
+                    text_features = emotion_adapter.fuse(text_features, emo_proj)
             
             # 特征归一化 + 对比学习InfoNCE损失
             image_norm = image_features.norm(dim=1, keepdim=True).clamp(min=1e-6)
@@ -147,10 +225,14 @@ def train_simple_clip(train_loader, test_loader, model, device, test_dataset, cl
             logit_scale = clip_model.logit_scale.exp()
             logits_per_image = logit_scale * image_features @ text_features.t()
             logits_per_text = logits_per_image.t()
-            labels = torch.arange(images.shape[0], device=device)
-            loss_i = F.cross_entropy(logits_per_image, labels)
-            loss_t = F.cross_entropy(logits_per_text, labels)
-            loss = (loss_i + loss_t) / 2
+            if use_multi_positive_loss:
+                captions = batch["query_text"]
+                loss = multi_positive_contrastive_loss(logits_per_image, captions)
+            else:
+                labels = torch.arange(images.shape[0], device=device)
+                loss_i = F.cross_entropy(logits_per_image, labels)
+                loss_t = F.cross_entropy(logits_per_text, labels)
+                loss = (loss_i + loss_t) / 2
             
             loss.backward()
             
@@ -164,31 +246,55 @@ def train_simple_clip(train_loader, test_loader, model, device, test_dataset, cl
             # 打印进度
             if (step + 1) % 9 == 0:
                 avg_loss = total_loss / num_batches
+                if wandb_enabled:
+                    wandb.log({"train/batch_loss": loss.item()}, step=epoch * (len(train_loader) + 1) + num_batches)
                 print(f"Epoch [{epoch+1}/{CONFIG['epochs']}], Step [{step+1}/{len(train_loader)}], Loss: {avg_loss:.4f}")
         
         # 评估
         print("开始评估...")
-        metrics, _ = evaluate_simple(model, test_loader, device, test_dataset, clip_model)
+        metrics, _ = evaluate_simple(model, test_loader, device, test_dataset, clip_model, emotion_adapter)
         
         print(f"Epoch [{epoch+1}/{CONFIG['epochs']}] 结果:")
-        print(f"R@1: {metrics['R@1']:.2f}% - R@5: {metrics['R@5']:.2f}%")
+        print(f"R@1: {metrics['R@1']:.2f}% - R@5: {metrics['R@5']:.2f}% | P@1: {metrics.get('P@1', 0.0):.2f}% | P@5: {metrics.get('P@5', 0.0):.2f}%")
+        if wandb_enabled:
+            current_lr = optimizer.param_groups[0]["lr"]
+            wandb.log({"train/epoch": epoch + 1, "train/avg_loss": total_loss / max(num_batches, 1), "eval/R@1": metrics["R@1"], "eval/R@5": metrics["R@5"], "eval/P@1": metrics.get("P@1", 0.0), "eval/P@5": metrics.get("P@5", 0.0), "train/lr": current_lr}, step=(epoch + 1) * (len(train_loader) + 1))
         
         # 保存最佳模型
         if metrics['R@1'] > best_r1:
             best_r1 = metrics['R@1']
             save_path = os.path.join(CONFIG["save_dir"], CONFIG["model_save_name"])
             os.makedirs(CONFIG["save_dir"], exist_ok=True)
-            torch.save(clip_model.state_dict(), save_path)
+            if emotion_adapter is not None:
+                torch.save({"clip_state_dict": clip_model.state_dict(), "adapter_state_dict": emotion_adapter.state_dict()}, save_path)
+            else:
+                torch.save(clip_model.state_dict(), save_path)
             print(f"最佳模型已保存: {save_path}")
+            if wandb_enabled:
+                wandb.save(save_path)
 
 def main():
     """主函数"""
     print("简化CLIP训练脚本")
     print("使用现有MSRVTT_Dataset和配置")
+    import argparse
+    parser = argparse.ArgumentParser(description="Simple CLIP training")
+    for key, value in CONFIG.items():
+        if isinstance(value, bool):
+            parser.add_argument(f"--{key}", action="store_true" if value is False else "store_false")
+        else:
+            parser.add_argument(f"--{key}", type=type(value) if value is not None else str, default=value)
+    args = parser.parse_args()
+    for key in CONFIG.keys():
+        CONFIG[key] = getattr(args, key)
+    use_multi_positive_loss = bool(CONFIG["use_multi_positive_loss"])
+    wandb_enabled = bool(CONFIG["wandb_project"])
     assert torch.cuda.is_available()
     # 设置设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"使用设备: {device}")
+    if wandb_enabled:
+        wandb.init(project=CONFIG["wandb_project"], entity=CONFIG["wandb_entity"] or None, config={"config": CONFIG})
     
     # 检查数据路径
     data_path = CONFIG["data_path"]
@@ -294,7 +400,15 @@ def main():
     print(f"测试集大小: {len(test_dataset)}")
     
     # 开始训练
-    train_simple_clip(train_loader, test_loader, model, device, test_dataset, clip_model)
+    emotion_adapter = None
+    if CONFIG["use_image_emotion_fusion"] or CONFIG["use_text_emotion_fusion"]:
+        emotion_adapter = EmotionAdapter(emo_dim=768, clip_dim=512).to(device)
+        for p in emotion_adapter.bert.parameters():
+            p.requires_grad = False
+        emotion_adapter.bert.eval()
+    train_simple_clip(train_loader, test_loader, model, device, test_dataset, clip_model, emotion_adapter, use_multi_positive_loss=use_multi_positive_loss, wandb_enabled=wandb_enabled)
+    if wandb_enabled:
+        wandb.finish()
     
     print("训练完成！")
 

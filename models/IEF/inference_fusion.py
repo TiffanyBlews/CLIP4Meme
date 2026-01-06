@@ -9,7 +9,10 @@ from tqdm import tqdm
 import argparse
 import os
 import random
-
+import sys
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 from model import CLIP4Meme
 from dataset import MSRVTT_Dataset
 from torch.utils.data import DataLoader
@@ -117,47 +120,47 @@ def evaluate_fusion(model, test_dataset, test_dataloader, device,
     
     print(f"相似度矩阵计算完成: 融合={fused_sim_matrix.shape}, QI={qi_sim_matrix.shape}, QC={qc_sim_matrix.shape}")
     
-    # 5. 计算R@k
     print("\n--- Computing R@k for Fusion Method ---")
     num_queries = fused_sim_matrix.shape[0]
     recalls = {}
+    precisions = {}
+    ks = [1, 5, 10, 50, 100]
+    valid_ks = [k for k in ks if k <= fused_sim_matrix.shape[1]]
     
-    for k in [1, 5, 10]:
+    for k in valid_ks:
         hits = 0
+        acc = 0.0
         for q_idx in range(num_queries):
             top_preds = torch.topk(fused_sim_matrix[q_idx], k=k).indices.tolist()
             gt_indices = caption_to_indices[all_captions_meta[q_idx]]
             if any(p in gt_indices for p in top_preds):
                 hits += 1
-                
-            # 打印前几个样本的详细预测
+            correct = sum(1 for p in top_preds if p in gt_indices)
+            acc += correct / float(k)
             if q_idx < print_n_samples and k == 10:
                 print(f"\n{'='*22} Sample {q_idx+1}/{print_n_samples} {'='*22}")
                 print(f"  [Query]      VID: {all_video_ids_meta[q_idx]}, Caption: {all_captions_meta[q_idx]}")
                 print(f"  [GT Indices] {gt_indices}")
                 print("  [Top-5 Predictions (Fused)]")
-                
                 top5_fused = torch.topk(fused_sim_matrix[q_idx], k=5)
                 top5_qi = torch.topk(qi_sim_matrix[q_idx], k=5)
                 top5_qc = torch.topk(qc_sim_matrix[q_idx], k=5)
-                
                 for rank in range(5):
                     pred_idx = top5_fused.indices[rank]
                     fused_score = top5_fused.values[rank]
                     qi_score = qi_sim_matrix[q_idx][pred_idx]
                     qc_score = qc_sim_matrix[q_idx][pred_idx]
-                    
                     mark = "✔️" if pred_idx in gt_indices else "❌"
                     print(f"    {rank+1}. {mark} Fused={fused_score:.4f} | QI={qi_score:.4f} | QC={qc_score:.4f}")
                     print(f"        VID={all_video_ids_meta[pred_idx]} | Cap: {all_captions_meta[pred_idx]}")
-        
         recalls[f'R@{k}'] = (hits / num_queries) * 100
+        precisions[f'P@{k}'] = (acc / num_queries) * 100
     
     print("\n--- Final Fusion Results ---")
-    for k, v in recalls.items():
-        print(f"  {k}: {v:.2f}%")
+    for k in valid_ks:
+        print(f"  R@{k}: {recalls[f'R@{k}']:.2f}% | P@{k}: {precisions[f'P@{k}']:.2f}%")
     
-    return recalls, fused_sim_matrix, qi_sim_matrix, qc_sim_matrix
+    return {**recalls, **precisions}, fused_sim_matrix, qi_sim_matrix, qc_sim_matrix
 
 def compare_multiple_alphas(model, test_dataset, test_dataloader, device, alphas, temperature=0.05):
     """
@@ -247,24 +250,26 @@ def compare_multiple_alphas(model, test_dataset, test_dataloader, device, alphas
         # 融合相似度矩阵
         fused_sim_matrix = alpha * qi_sim_matrix + (1 - alpha) * qc_sim_matrix
         
-        # 计算R@k
         recalls = {}
-        for k in [1, 5, 10]:
+        precisions = {}
+        ks = [1, 5, 10, 50, 100]
+        valid_ks = [k for k in ks if k <= qi_sim_matrix.shape[1]]
+        for k in valid_ks:
             hits = 0
+            acc = 0.0
             for q_idx in range(num_queries):
                 top_preds = torch.topk(fused_sim_matrix[q_idx], k=k).indices.tolist()
                 gt_indices = caption_to_indices[all_captions_meta[q_idx]]
                 if any(p in gt_indices for p in top_preds):
                     hits += 1
-            
+                correct = sum(1 for p in top_preds if p in gt_indices)
+                acc += correct / float(k)
             recalls[f'R@{k}'] = (hits / num_queries) * 100
-        
-        all_results[alpha] = recalls
-        
-        # 打印当前alpha的结果
+            precisions[f'P@{k}'] = (acc / num_queries) * 100
+        all_results[alpha] = {**recalls, **precisions}
         print(f"Alpha = {alpha:.2f}: ", end="")
-        for k in [1, 5, 10]:
-            print(f"R@{k}={recalls[f'R@{k}']:.2f}%", end=" ")
+        for k in valid_ks:
+            print(f"R@{k}={recalls[f'R@{k}']:.2f}% P@{k}={precisions[f'P@{k}']:.2f}%", end=" ")
         print()
     
     # 打印比较表格
@@ -274,8 +279,10 @@ def compare_multiple_alphas(model, test_dataset, test_dataloader, device, alphas
     
     # 表头
     header = f"{'Alpha':<8} {'Branch':<12}"
-    for k in [1, 5, 10]:
-        header += f" R@{k}"
+    ks = [1, 5, 10, 50, 100]
+    valid_ks = [k for k in ks if k <= qi_sim_matrix.shape[1]]
+    for k in valid_ks:
+        header += f" R@{k} P@{k}"
     print(header)
     print("-" * 80)
     
@@ -290,14 +297,20 @@ def compare_multiple_alphas(model, test_dataset, test_dataloader, device, alphas
             branch_name = f"Fusion"
         
         row = f"{alpha:<8.2f} {branch_name:<12}"
-        for k in [1, 5, 10]:
-            row += f" {all_results[alpha][f'R@{k}']:<10.2f}"
+        for k in valid_ks:
+            row += f" {all_results[alpha][f'R@{k}']:<10.2f} {all_results[alpha][f'P@{k}']:<10.2f}"
         print(row)
     
     # 找到最佳alpha
     best_alpha_r1 = max(alphas, key=lambda a: all_results[a]['R@1'])
     best_alpha_r5 = max(alphas, key=lambda a: all_results[a]['R@5'])
     best_alpha_r10 = max(alphas, key=lambda a: all_results[a]['R@10'])
+    best_alpha_r50 = None
+    best_alpha_r100 = None
+    if 'R@50' in next(iter(all_results.values())):
+        best_alpha_r50 = max(alphas, key=lambda a: all_results[a]['R@50'])
+    if 'R@100' in next(iter(all_results.values())):
+        best_alpha_r100 = max(alphas, key=lambda a: all_results[a]['R@100'])
     
     print("\n" + "="*80)
     print("BEST ALPHA VALUES")
@@ -305,6 +318,10 @@ def compare_multiple_alphas(model, test_dataset, test_dataloader, device, alphas
     print(f"Best for R@1:  α = {best_alpha_r1:.2f} (R@1 = {all_results[best_alpha_r1]['R@1']:.2f}%)")
     print(f"Best for R@5:  α = {best_alpha_r5:.2f} (R@5 = {all_results[best_alpha_r5]['R@5']:.2f}%)")
     print(f"Best for R@10: α = {best_alpha_r10:.2f} (R@10 = {all_results[best_alpha_r10]['R@10']:.2f}%)")
+    if best_alpha_r50 is not None:
+        print(f"Best for R@50: α = {best_alpha_r50:.2f} (R@50 = {all_results[best_alpha_r50]['R@50']:.2f}%)")
+    if best_alpha_r100 is not None:
+        print(f"Best for R@100: α = {best_alpha_r100:.2f} (R@100 = {all_results[best_alpha_r100]['R@100']:.2f}%)")
     
     return all_results
 

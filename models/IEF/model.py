@@ -6,7 +6,11 @@ import torch.nn.functional as F
 from transformers import BertModel, BertTokenizer
 import clip
 import numpy as np
-from co_attention import Co_attention_block
+import os, sys
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+from models.IEF.co_attention import Co_attention_block
 class CLIP4Meme(nn.Module):
     """
     Model with a STABLE architecture for Stage 1 (QI) training.
@@ -27,6 +31,7 @@ class CLIP4Meme(nn.Module):
         clip_feature_dim = self.clip.visual.output_dim
         bert_feature_dim = self.bert_model.config.hidden_size
         self.emotion_projection = nn.Linear(bert_feature_dim, clip_feature_dim)
+        self.emotion_gate = nn.Parameter(torch.tensor(0.1))
         self.co_attention = Co_attention_block(
             num_attention_heads=8, hidden_size=clip_feature_dim, dropout_rate=0.1
         )
@@ -82,12 +87,13 @@ class CLIP4Meme(nn.Module):
                 with torch.no_grad():
                     emotion_feat_bert = self.encode_emotion(emotion_ids, emotion_mask)
                 projected_emotion_feat = self.emotion_projection(emotion_feat_bert.type(self.emotion_projection.weight.dtype))
-                image_feat = image_feat + projected_emotion_feat
+                projected_emotion_feat = F.normalize(projected_emotion_feat, dim=-1)
+                image_feat = image_feat + self.emotion_gate * projected_emotion_feat
             
             # 3. 跨模态融合 (Cross-Modal Fusion)
             # Co-attention 融合 Image 和 Context (图片描述)
-            image_feat_seq = F.normalize(image_feat, dim=-1).unsqueeze(1)
-            image_mask_for_attention = torch.ones(image_feat_seq.size(0), 1, 1, 1).to(image.device)
+            image_feat_seq = image_feat.unsqueeze(1)
+            image_mask_for_attention = torch.zeros(image_feat_seq.size(0), 1, 1, 1, device=image.device)
             
             fused_image_feat, _ = self.co_attention(
                 image_feat_seq, image_mask_for_attention,

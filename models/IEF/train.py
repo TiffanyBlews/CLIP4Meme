@@ -12,28 +12,31 @@ import os
 import argparse
 from collections import defaultdict
 import wandb
-import yaml
+# import yaml
 from datetime import datetime
-
+import sys
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 from model import CLIP4Meme
 from dataset import MSRVTT_Dataset
 
 CONFIG = {
-    "data_path": "/root/zt/imgflip_results/msrvtt",
-    "image_path": "/root/zt/imgflip_results/images",
+    "data_path": "./imgflip_data/msrvtt",
+    "image_path": "./imgflip_data/images",
     "train_csv": "train_ids.csv",
     "train_json": "train_data.json",
     "train_emotion_json": "train_emotion.json",
     "test_json": "test_data.json",
     "test_emotion_json": "test_emotion.json",
     
-    "batch_size": 64, "epochs": 20, "lr": 1e-4, "coef_lr": 1e-3,
+    "batch_size": 64, "epochs": 10, "lr": 1e-4, "coef_lr": 1e-1,
     "weight_decay": 0.01, "min_lr": 0,
     
     "pretrained_clip_name": "ViT-B/32", "use_emotion_fusion": True, "seed": 42,
 
     "save_dir": "./checkpoints_imgflip",
-    "checkpoint_path": "checkpoints_imgflip/qi.pth",
+    "checkpoint_path": None,
     
     # wandb配置
     "wandb_project": "clip4meme",
@@ -190,6 +193,30 @@ def symmetric_contrastive_loss(sim_matrix):
     loss = (F.cross_entropy(sim_matrix, labels) + F.cross_entropy(sim_matrix.t(), labels)) / 2
     return loss
 
+def multi_positive_contrastive_loss(sim_matrix, captions):
+    # captions: list[str] 长度为B，同文本视为正样本
+    B = sim_matrix.size(0)
+    device = sim_matrix.device
+    # 构造正样本掩码 [B,B]
+    # 注意：自身也算正样本
+    pos_mask = torch.zeros((B, B), dtype=torch.bool, device=device)
+    for i in range(B):
+        for j in range(B):
+            if captions[i] == captions[j]:
+                pos_mask[i, j] = True
+    # 对每一行做 log-softmax 后，最大化正样本的概率和
+    log_prob = F.log_softmax(sim_matrix, dim=1)
+    # 为避免一行没有正样本（极端情况），至少包含自身
+    pos_counts = pos_mask.sum(dim=1).clamp(min=1)
+    pos_log_prob_sum = (log_prob.masked_fill(~pos_mask, 0.0)).sum(dim=1)
+    loss_row = -(pos_log_prob_sum / pos_counts)
+    # 对称项：列方向同理
+    log_prob_T = F.log_softmax(sim_matrix.t(), dim=1)
+    pos_counts_T = pos_mask.t().sum(dim=1).clamp(min=1)
+    pos_log_prob_sum_T = (log_prob_T.masked_fill(~pos_mask.t(), 0.0)).sum(dim=1)
+    loss_col = -(pos_log_prob_sum_T / pos_counts_T)
+    return (loss_row.mean() + loss_col.mean()) / 2
+
 def eval_epoch(model, test_dataset, test_dataloader, device, branch, print_n_samples=5):
     model.eval()
     print(f"\n--- Evaluating {branch} branch ---")
@@ -255,13 +282,17 @@ def eval_epoch(model, test_dataset, test_dataloader, device, branch, print_n_sam
     print("\n--- Computing R@k & Detailed Predictions ---")
     num_queries = sim_matrix.shape[0]
     recalls = {}
+    precisions = {}
     for k in [1, 5, 10]:
         hits = 0
+        acc = 0.0
         for q_idx in range(num_queries):
             top_preds = torch.topk(sim_matrix[q_idx], k=k).indices.tolist()
             gt_indices = caption_to_indices[all_captions_meta[q_idx]]
             if any(p in gt_indices for p in top_preds):
                 hits += 1
+            correct = sum(1 for p in top_preds if p in gt_indices)
+            acc += correct / float(k)
             if q_idx < print_n_samples and k == 10:
                 print(f"\n{'='*22} Sample {q_idx+1}/{print_n_samples} {'='*22}")
                 print(f"  [Query]      VID: {all_video_ids_meta[q_idx]}, Caption: {all_captions_meta[q_idx]}")
@@ -272,9 +303,13 @@ def eval_epoch(model, test_dataset, test_dataloader, device, branch, print_n_sam
                     mark, score = "✔️" if pred_idx in gt_indices else "❌", top5.values[rank]
                     print(f"    {rank+1}. {mark} score={score:.4f} | VID={all_video_ids_meta[pred_idx]} | Cap: {all_captions_meta[pred_idx]}")
         recalls[f'R@{k}'] = (hits / num_queries) * 100
+        precisions[f'P@{k}'] = (acc / num_queries) * 100
     print("\n--- Final Evaluation Results ---")
-    for k, v in recalls.items(): print(f"  {k}: {v:.2f}%")
-    return recalls
+    for k in [1, 5, 10]:
+        r = recalls[f'R@{k}']
+        p = precisions[f'P@{k}']
+        print(f"  R@{k}: {r:.2f}% | P@{k}: {p:.2f}%")
+    return {**recalls, **precisions}
 
 def main(args):
     print(args)
@@ -328,9 +363,9 @@ def main(args):
         param.requires_grad = False
     
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr * args.coef_lr},
-        {'params': [p for n, p in model.clip.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': args.lr * args.coef_lr},
-        {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': args.lr},
+        {'params': [p for n, p in model.clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': max(5e-6, args.lr * args.coef_lr)},
+        {'params': [p for n, p in model.clip.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': max(5e-6, args.lr * args.coef_lr)},
+        {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay, 'lr': max(5e-6, args.lr)},
         {'params': [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith(('clip.', 'bert_model.')) and any(nd in n for nd in no_decay)], 'weight_decay': 0.0, 'lr': args.lr}
     ]
     optimizer = optim.AdamW(optimizer_grouped_parameters, lr=args.lr)
@@ -367,7 +402,8 @@ def main(args):
                 branch=branch_name.lower()
             )
             
-            loss = symmetric_contrastive_loss(sim_matrix)
+            captions = batch['query_text']
+            loss = multi_positive_contrastive_loss(sim_matrix, captions)
             loss.backward()
             
             # 记录梯度（如果启用）
@@ -455,7 +491,9 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Meme-Retrieval model based on QI/QC branches.")
     parser.add_argument('--train', type=str, required=True, choices=['qi', 'qc'], help="Train QI or QC branch")
+    
     for key, value in CONFIG.items():
         parser.add_argument(f'--{key}', type=type(value) if value is not None else str, default=value)
+        
     parsed_args = parser.parse_args()
     main(parsed_args)
